@@ -1,0 +1,456 @@
+name: Windows App Cloud PC
+
+on:
+  workflow_dispatch:
+
+jobs:
+  cloud-pc:
+    runs-on: windows-latest
+    timeout-minutes: 360
+
+    steps:
+
+      # ==========================================
+      # RDP
+      # ==========================================
+      - name: Configure Remote Desktop
+        shell: powershell
+        run: |
+
+          $ErrorActionPreference = "Stop"
+
+          Write-Host "Configurando RDP..."
+
+          Set-ItemProperty `
+            -Path "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server" `
+            -Name "fDenyTSConnections" `
+            -Value 0 `
+            -Force
+
+          Set-ItemProperty `
+            -Path "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp" `
+            -Name "UserAuthentication" `
+            -Value 1 `
+            -Force
+
+          Set-ItemProperty `
+            -Path "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp" `
+            -Name "SecurityLayer" `
+            -Value 1 `
+            -Force
+
+          Enable-NetFirewallRule `
+            -DisplayGroup "Remote Desktop"
+
+          Set-Service `
+            -Name "TermService" `
+            -StartupType Automatic
+
+          Restart-Service `
+            -Name "TermService" `
+            -Force
+
+          Write-Host "RDP configurado."
+
+      # ==========================================
+      # USUÁRIO RDP
+      # ==========================================
+      - name: Create Gaming User
+        shell: powershell
+        run: |
+
+          $ErrorActionPreference = "Stop"
+
+          $username = "Gamer"
+
+          $upper = "ABCDEFGHIJKLMNOPQRSTUVWXYZ".ToCharArray()
+          $lower = "abcdefghijklmnopqrstuvwxyz".ToCharArray()
+          $numbers = "0123456789".ToCharArray()
+          $special = "!@#$%^&*_-+=".ToCharArray()
+
+          $passwordChars = @()
+
+          $passwordChars += $upper | Get-Random -Count 4
+          $passwordChars += $lower | Get-Random -Count 4
+          $passwordChars += $numbers | Get-Random -Count 4
+          $passwordChars += $special | Get-Random -Count 4
+
+          $password = -join (
+            $passwordChars |
+            Sort-Object { Get-Random }
+          )
+
+          $securePassword = ConvertTo-SecureString `
+            $password `
+            -AsPlainText `
+            -Force
+
+          if (Get-LocalUser `
+              -Name $username `
+              -ErrorAction SilentlyContinue) {
+
+            Remove-LocalUser `
+              -Name $username
+          }
+
+          New-LocalUser `
+            -Name $username `
+            -Password $securePassword `
+            -AccountNeverExpires `
+            -PasswordNeverExpires
+
+          Add-LocalGroupMember `
+            -Group "Administrators" `
+            -Member $username
+
+          Add-LocalGroupMember `
+            -Group "Remote Desktop Users" `
+            -Member $username
+
+          "RDP_USERNAME=$username" >> $env:GITHUB_ENV
+          "RDP_PASSWORD=$password" >> $env:GITHUB_ENV
+
+          Write-Host "Usuário Gamer criado."
+
+      # ==========================================
+      # INSTALAR TAILSCALE
+      # ==========================================
+      - name: Install and Verify Tailscale
+        shell: powershell
+        run: |
+
+          $ErrorActionPreference = "Stop"
+
+          Write-Host "=========================================="
+          Write-Host "       INSTALANDO TAILSCALE"
+          Write-Host "=========================================="
+
+          $installer = "$env:TEMP\tailscale.msi"
+
+          Write-Host "Baixando instalador..."
+
+          Invoke-WebRequest `
+            -Uri "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi" `
+            -OutFile $installer `
+            -UseBasicParsing
+
+          if (-not (Test-Path $installer)) {
+            throw "Não foi possível baixar o instalador do Tailscale."
+          }
+
+          Write-Host "Download concluído."
+
+          Write-Host "Instalando..."
+
+          $process = Start-Process `
+            -FilePath "msiexec.exe" `
+            -ArgumentList @(
+              "/i",
+              "`"$installer`"",
+              "/quiet",
+              "/norestart"
+            ) `
+            -Wait `
+            -PassThru
+
+          Write-Host "Código da instalação: $($process.ExitCode)"
+
+          if ($process.ExitCode -ne 0) {
+            throw "A instalação do Tailscale falhou."
+          }
+
+          Start-Sleep -Seconds 5
+
+          $tailscale = "$env:ProgramFiles\Tailscale\tailscale.exe"
+
+          if (-not (Test-Path $tailscale)) {
+
+            $possiblePaths = @(
+              "$env:ProgramFiles\Tailscale\tailscale.exe",
+              "${env:ProgramFiles(x86)}\Tailscale\tailscale.exe"
+            )
+
+            foreach ($path in $possiblePaths) {
+              if (Test-Path $path) {
+                $tailscale = $path
+                break
+              }
+            }
+          }
+
+          if (-not (Test-Path $tailscale)) {
+            throw "tailscale.exe não foi encontrado depois da instalação."
+          }
+
+          Write-Host ""
+          Write-Host "Tailscale encontrado:"
+          Write-Host $tailscale
+
+          & $tailscale version
+
+          "TAILSCALE_PATH=$tailscale" >> $env:GITHUB_ENV
+
+          Write-Host "Tailscale instalado corretamente."
+
+          Remove-Item `
+            $installer `
+            -Force `
+            -ErrorAction SilentlyContinue
+
+      # ==========================================
+      # CONECTAR TAILSCALE
+      # ==========================================
+      - name: Connect Tailscale
+        shell: powershell
+        env:
+          TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
+        run: |
+
+          $ErrorActionPreference = "Stop"
+
+          Write-Host "=========================================="
+          Write-Host "       CONECTANDO TAILSCALE"
+          Write-Host "=========================================="
+
+          if ([string]::IsNullOrWhiteSpace(
+            $env:TAILSCALE_AUTH_KEY
+          )) {
+
+            throw @"
+TAILSCALE_AUTH_KEY não foi encontrado.
+
+Crie no GitHub:
+
+Settings
+→ Secrets and variables
+→ Actions
+→ New repository secret
+
+Nome:
+TAILSCALE_AUTH_KEY
+"@
+          }
+
+          $tailscale = $env:TAILSCALE_PATH
+
+          if (-not (Test-Path $tailscale)) {
+            throw "Executável do Tailscale não encontrado."
+          }
+
+          Write-Host "Conectando..."
+
+          & $tailscale up `
+            --authkey="$env:TAILSCALE_AUTH_KEY" `
+            --hostname="github-cloud-pc-$env:GITHUB_RUN_ID"
+
+          Start-Sleep -Seconds 10
+
+          $ip = $null
+
+          for ($i = 1; $i -le 20; $i++) {
+
+            Write-Host "Obtendo IP... tentativa $i/20"
+
+            $ip = & $tailscale ip -4 2>$null
+
+            if ($ip) {
+              break
+            }
+
+            Start-Sleep -Seconds 3
+          }
+
+          if ([string]::IsNullOrWhiteSpace($ip)) {
+            throw "O Tailscale conectou, mas não forneceu um IP."
+          }
+
+          $ip = $ip.Trim()
+
+          "TAILSCALE_IP=$ip" >> $env:GITHUB_ENV
+
+          Write-Host ""
+          Write-Host "=========================================="
+          Write-Host "       WINDOWS APP - CONEXÃO"
+          Write-Host "=========================================="
+          Write-Host ""
+          Write-Host "PC NAME:"
+          Write-Host $ip
+          Write-Host ""
+          Write-Host "USERNAME:"
+          Write-Host $env:RDP_USERNAME
+          Write-Host ""
+          Write-Host "PASSWORD:"
+          Write-Host $env:RDP_PASSWORD
+          Write-Host ""
+          Write-Host "PORT:"
+          Write-Host "3389"
+          Write-Host ""
+          Write-Host "=========================================="
+
+      # ==========================================
+      # OTIMIZAÇÃO
+      # ==========================================
+      - name: Gaming Optimization
+        shell: powershell
+        run: |
+
+          $ErrorActionPreference = "SilentlyContinue"
+
+          Write-Host "Aplicando otimizações..."
+
+          powercfg /setactive SCHEME_MIN
+
+          New-Item `
+            -Path "HKCU:\Software\Microsoft\GameBar" `
+            -Force | Out-Null
+
+          Set-ItemProperty `
+            -Path "HKCU:\Software\Microsoft\GameBar" `
+            -Name "AllowAutoGameMode" `
+            -Type DWord `
+            -Value 1 `
+            -Force
+
+          Set-ItemProperty `
+            -Path "HKCU:\Control Panel\Desktop" `
+            -Name "MenuShowDelay" `
+            -Value "0"
+
+          Write-Host "Otimizações aplicadas."
+
+      # ==========================================
+      # TESTAR RDP
+      # ==========================================
+      - name: Test RDP Connection
+        shell: powershell
+        run: |
+
+          $ErrorActionPreference = "Stop"
+
+          Write-Host "Testando RDP..."
+
+          $result = Test-NetConnection `
+            -ComputerName $env:TAILSCALE_IP `
+            -Port 3389
+
+          if (-not $result.TcpTestSucceeded) {
+
+            Write-Error @"
+RDP não está acessível.
+
+IP:
+$env:TAILSCALE_IP
+
+Porta:
+3389
+"@
+
+            exit 1
+          }
+
+          Write-Host "RDP está funcionando."
+
+      # ==========================================
+      # INFORMAÇÕES FINAIS
+      # ==========================================
+      - name: Show Windows App Information
+        shell: powershell
+        run: |
+
+          Write-Host ""
+          Write-Host ""
+          Write-Host "################################################"
+          Write-Host "#                                              #"
+          Write-Host "#          WINDOWS APP CLOUD PC                #"
+          Write-Host "#                                              #"
+          Write-Host "################################################"
+          Write-Host ""
+          Write-Host "PC NAME:"
+          Write-Host $env:TAILSCALE_IP
+          Write-Host ""
+          Write-Host "USERNAME:"
+          Write-Host $env:RDP_USERNAME
+          Write-Host ""
+          Write-Host "PASSWORD:"
+          Write-Host $env:RDP_PASSWORD
+          Write-Host ""
+          Write-Host "PORT:"
+          Write-Host "3389"
+          Write-Host ""
+          Write-Host "NO WINDOWS APP:"
+          Write-Host "PC name = IP acima"
+          Write-Host "Username = Gamer"
+          Write-Host "Password = senha acima"
+          Write-Host ""
+          Write-Host "################################################"
+
+      # ==========================================
+      # MANTER PC ONLINE
+      # ==========================================
+      - name: Keep Cloud PC Online
+        shell: powershell
+        run: |
+
+          $start = Get-Date
+
+          Write-Host ""
+          Write-Host "=========================================="
+          Write-Host "          CLOUD PC ONLINE"
+          Write-Host "=========================================="
+          Write-Host ""
+          Write-Host "PC NAME:"
+          Write-Host $env:TAILSCALE_IP
+          Write-Host ""
+          Write-Host "Use o Windows App para conectar."
+          Write-Host ""
+
+          while ($true) {
+
+            $cpu = Get-CimInstance Win32_Processor |
+              Measure-Object `
+                -Property LoadPercentage `
+                -Average
+
+            $os = Get-CimInstance `
+              Win32_OperatingSystem
+
+            $totalRAM = [math]::Round(
+              $os.TotalVisibleMemorySize / 1MB,
+              2
+            )
+
+            $freeRAM = [math]::Round(
+              $os.FreePhysicalMemory / 1MB,
+              2
+            )
+
+            $usedRAM = [math]::Round(
+              $totalRAM - $freeRAM,
+              2
+            )
+
+            $elapsed = `
+              (Get-Date) - $start
+
+            Write-Host ""
+            Write-Host "========== STATUS =========="
+
+            Write-Host `
+              "CPU: $([math]::Round($cpu.Average,1))%"
+
+            Write-Host `
+              "RAM: $usedRAM GB / $totalRAM GB"
+
+            Write-Host `
+              "TEMPO: $($elapsed.Hours)h $($elapsed.Minutes)m $($elapsed.Seconds)s"
+
+            Write-Host `
+              "RDP: ONLINE"
+
+            Write-Host `
+              "TAILSCALE: ONLINE"
+
+            Write-Host "============================"
+
+            Start-Sleep -Seconds 30
+          }
